@@ -1,0 +1,27 @@
+# Private monthly-close inputs and generated workbooks
+/monthly-close-input.md
+/CashFlow/
+/Fidelity/
+/Robinhood/
+/Charles/
+/IBKR/
+/Output/
+/outputs/
+
+# Local development and workbook inspection artifacts
+/agent-dev/
+/.cache/
+/.venv/
+/skills/update-treasury/node_modules
+**/__pycache__/
+*.py[cod]
+~$*.xlsx
+~$*.xls
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Operating-system metadata
+.DS_Store

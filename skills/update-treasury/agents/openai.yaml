@@ -1,0 +1,4 @@
+interface:
+  display_name: "One Piece Monthly Close Agent"
+  short_description: "Build and archive one monthly-close workbook"
+  default_prompt: "Use $update-treasury to build the One Piece monthly close from raw inputs and publish one result under Output/YYYY-MM."
