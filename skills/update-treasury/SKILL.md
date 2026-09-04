@@ -14,6 +14,8 @@ Use this Skill for `start`, `continue`, `One Piece`, `小金库`, or requests to
 3. Read `monthly-close-input.md` from the project root. Values supplied directly by the user take precedence over that file. Treat its opening cash and opening-holdings table as the explicit pre-period baseline; do not assume missing historical CSVs or statements imply zero opening positions.
 4. For a complete close, run `scripts/update_treasury.mjs`. It calls the starting-workbook step, `import_cashflow.mjs`, `import_stock.mjs`, `update_asset.mjs`, `update_summary.mjs`, and `apply_workbook_format.mjs` in that order. `start` builds from code. `continue` explicitly loads `Output/bootstrap/One_Piece.xlsx`. Do not run standalone scripts separately for a complete close.
 
+The public [assets/One_Piece_Template.xlsx](assets/One_Piece_Template.xlsx) workbook is a privacy-safe example of the code-built four-sheet structure and presentation. It contains only zero-value sample inputs. Do not use it as an opening-balance source or as a substitute for `monthly-close-input.md` or the private Bootstrap used by `continue`.
+
 ## Monthly-close workflow
 
 ### 1. Import CashFlow

@@ -2,6 +2,8 @@
 
 Excel Agent is a Codex skill and script collection for building a four-sheet monthly treasury workbook (`CashFlow`, `Stock`, `Asset`, and `Summary`) from cash-flow exports, brokerage statements, and manually supplied balances.
 
+A privacy-safe blank workbook is available at `skills/update-treasury/assets/One_Piece_Template.xlsx`. It demonstrates the generated layout and formatting but is not an opening-balance source.
+
 ## Private data
 
 The repository intentionally excludes all local financial data and generated workbooks:

@@ -9,6 +9,10 @@
 
 Preserve exactly four sheets in this order: `CashFlow`, `Stock`, `Asset`, `Summary`. Do not create a helper or dropdown-options sheet.
 
+## Public template asset
+
+`assets/One_Piece_Template.xlsx` is generated from code with `monthly-close-input.example.md`. It demonstrates the four-sheet layout, formulas, charts, and deterministic formatting without containing actual transactions, balances, positions, statement data, or local paths. It is documentation and a reusable blank workbook, not the financial baseline for either close mode. Regenerate it from the public example input after structural or formatting changes.
+
 ## Template-free bootstrap inputs
 
 Read these values from `monthly-close-input.md`; never recover them from a prior workbook:
