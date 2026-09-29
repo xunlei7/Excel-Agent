@@ -48,11 +48,40 @@ export async function continueTreasuryWorkbook({ bootstrapWorkbookPath, outputPa
   for (const name of presentSheets.reverse()) {
     if (!requiredSheets.includes(name)) workbook.worksheets.getItem(name).delete();
   }
+  // Capture verified historical values before any workbook mutation can trigger
+  // recalculation of imported legacy formulas in artifact-tool.
+  freezeExistingSummaryHistory(workbook.worksheets.getItem("Summary"));
   migrateLegacyStockLayout(workbook.worksheets.getItem("Stock"));
   migrateLegacyAssetAccounts(workbook.worksheets.getItem("Asset"));
   await fs.mkdir(path.dirname(destination), { recursive: true });
-  await saveWorkbookFormulaSafe(workbook, destination);
+  // Preserve legacy CashFlow headers in this intermediate file. The CashFlow
+  // importer needs them to detect and migrate the old Book/Note layout before
+  // fixed compact headers are restored on the next save.
+  await saveWorkbookFormulaSafe(workbook, destination, { restoreFixedText: false });
   return { output: destination, sheets: requiredSheets, mode: "continue", bootstrapWorkbook: source };
+}
+
+// Imported Bootstrap history is a completed monthly-close snapshot. Keep its
+// displayed values stable during the intermediate save: artifact-tool cannot
+// evaluate every legacy Excel formula and would otherwise replace historical
+// cash / net-worth caches with #VALUE!. update_summary.mjs rebuilds formulas
+// for the new close while retaining these pre-opening rows as values.
+function freezeExistingSummaryHistory(sheet) {
+  const headers = sheet.getRange("A13:AZ13").values[0].map((value) => String(value ?? "").trim());
+  const cashCol = headers.indexOf("实时持有现金");
+  if (cashCol < 0) return;
+  const values = sheet.getRangeByIndexes(13, 0, 1033, cashCol + 1).values;
+  let populatedRows = 0;
+  for (const row of values) {
+    if (!row[0]) break;
+    populatedRows += 1;
+  }
+  if (!populatedRows) return;
+  const history = values.slice(0, populatedRows);
+  const range = sheet.getRangeByIndexes(13, 0, populatedRows, cashCol + 1);
+  range.clear({ applyTo: "contents" });
+  range.formulas = history.map((row) => row.map(() => ""));
+  range.values = history;
 }
 
 // Older verified bootstrap files stored the holdings summary immediately below
@@ -81,28 +110,69 @@ function migrateLegacyAssetAccounts(sheet) {
   const headers = sheet.getRange("A12:H12").values[0].map((value) => String(value ?? "").trim());
   const expected = ["资产名称", "Category", "币种", "Amount", "FX Rate", "Converted Amount", "Bucket", "Update time"];
   if (JSON.stringify(headers) !== JSON.stringify(expected)) return;
-  const rows = sheet.getRange("A13:C201").values;
-  const names = new Set(rows.map((row) => String(row[0] ?? "").trim()));
-  const templateRow = 21;
-  let targetRow = 13 + rows.findIndex((row) => !String(row[0] ?? "").trim());
-  if (targetRow < 13) targetRow = 202;
-  for (const [name, category, currency, bucket] of [["IBKR Cash", "Cash", "USD", "Security"], ["Charles Cash", "Cash", "USD", "Security"]]) {
-    if (names.has(name)) continue;
-    if (targetRow > 201) throw new Error(`Asset detail block has no row for legacy account ${name}.`);
-    sheet.getRange(`A${targetRow}:H${targetRow}`).copyFrom(sheet.getRange(`A${templateRow}:H${templateRow}`), "all");
-    sheet.getRange(`A${targetRow}:C${targetRow}`).values = [[name, category, currency]];
-    sheet.getRange(`G${targetRow}`).values = [[bucket]];
-    sheet.getRange(`D${targetRow}`).values = [[null]];
-    sheet.getRange(`H${targetRow}`).values = [[null]];
-    names.add(name);
-    targetRow += 1;
+  const detailRange = sheet.getRange("A13:H201");
+  const values = detailRange.values;
+  const formulas = detailRange.formulas;
+  const existingAccounts = new Map();
+  const securities = [];
+  const otherRows = [];
+  for (let index = 0; index < values.length; index += 1) {
+    const rowValues = values[index];
+    const rowFormulas = formulas[index];
+    const name = String(rowValues[0] ?? "").trim();
+    const category = String(rowValues[1] ?? "").trim();
+    const currency = String(rowValues[2] ?? "").trim().toUpperCase();
+    if (!name) continue;
+    const item = { values: rowValues, formulas: rowFormulas };
+    if (category === "Account" || category === "Cash") existingAccounts.set(`${name}|${currency}`, item);
+    else if (category === "Stock" || category === "ETF") securities.push(item);
+    else otherRows.push(item);
   }
+
+  const ordered = [];
+  const canonicalAccountKeys = new Set();
+  for (const [name, category, currency, bucket] of ACCOUNTS) {
+    const key = `${name}|${currency}`;
+    canonicalAccountKeys.add(key);
+    const existing = existingAccounts.get(key);
+    const rowValues = existing?.values || [name, category, currency, null, null, null, bucket, null];
+    ordered.push({
+      kind: "account",
+      values: [name, category, currency, rowValues[3] ?? null, null, null, rowValues[6] || bucket, rowValues[7] ?? null],
+      formulas: existing?.formulas || Array(8).fill(""),
+    });
+  }
+  for (const [key, item] of existingAccounts) {
+    if (canonicalAccountKeys.has(key)) continue;
+    ordered.push({ kind: "account", values: item.values, formulas: item.formulas });
+  }
+  for (const item of [...securities, ...otherRows]) ordered.push({ kind: "preserved", ...item });
+  if (ordered.length > 189) throw new Error("Asset detail block has no room for the canonical account order.");
+
+  detailRange.clear({ applyTo: "contents" });
+  ordered.forEach((item, offset) => {
+    const row = 13 + offset;
+    const [name, category, currency, amount, , , bucket, updateTime] = item.values;
+    sheet.getRange(`A${row}:D${row}`).values = [[name, category, currency, amount]];
+    sheet.getRange(`G${row}`).values = [[bucket]];
+    writeAssetFxFormulas(sheet, row);
+    const amountFormula = item.formulas?.[3];
+    if (item.kind === "preserved" && amountFormula) sheet.getRange(`D${row}`).formulas = [[amountFormula]];
+    const updateFormula = item.formulas?.[7];
+    if (updateFormula) sheet.getRange(`H${row}`).formulas = [[updateFormula]];
+    else sheet.getRange(`H${row}`).values = [[updateTime ?? null]];
+  });
   for (let row = 4; row <= 8; row += 1) {
     sheet.getRange(`B${row}`).formulas = [[`=SUMIFS($F$13:$F$201,$G$13:$G$201,A${row})`]];
     sheet.getRange(`C${row}`).formulas = [[`=IFERROR(B${row}/$B$9,0)`]];
   }
   sheet.getRange("B9").formulas = [["=SUM(B4:B8)"]];
   sheet.getRange("C9").formulas = [["=IF(B9=0,0,SUM(C4:C8))"]];
+}
+
+function writeAssetFxFormulas(sheet, row) {
+  sheet.getRange(`E${row}`).formulas = [[`=IF(C${row}="","",IF(C${row}=$K$3,1,IF(AND(C${row}="USD",$K$3="CNY"),$K$4,IF(AND(C${row}="CNY",$K$3="USD"),1/$K$4,""))))`]];
+  sheet.getRange(`F${row}`).formulas = [[`=IF(OR(D${row}="",E${row}=""),"",D${row}*E${row})`]];
 }
 
 function buildCashflow(workbook) {
@@ -120,25 +190,25 @@ function buildCashflow(workbook) {
   ];
   sheet.getRange("A7:B7").values = [["Net Cash Flow", null]];
   section(sheet, "A10:J10", "Income"); section(sheet, "N10:W10", "Expenses"); section(sheet, "AA10:AM10", "Transfer");
-  const income = ["Date", "Year-Month", "Category", "Tag", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"];
+  const income = ["Date", "Year-Month", "Category", "Type", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"];
   const expense = [...income];
-  const transfer = ["Date", "Year-Month", "Counterparty", "Category", "Tag", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount", "Outstanding", "Status"];
+  const transfer = ["Date", "Year-Month", "Counterparty", "Category", "Type", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount", "Outstanding", "Status"];
   header(sheet.getRange("A11:J11"), income); header(sheet.getRange("N11:W11"), expense); header(sheet.getRange("AA11:AM11"), transfer);
   sheet.getRange("B3").formulas = [["=SUMIFS($J$12:$J$454,$B$12:$B$454,$B$2)"]];
-  sheet.getRange("B4").formulas = [["=SUMIFS($W$12:$W$456,$O$12:$O$456,$B$2)"]];
+  sheet.getRange("B4").formulas = [["=SUMIFS($W$12:$W$1000,$O$12:$O$1000,$B$2)"]];
   sheet.getRange("B5").formulas = [["=SUMIFS($AK$12:$AK$500,$AB$12:$AB$500,$B$2)"]];
   sheet.getRange("E3").formulas = [["=IF(K3=0,\"\",_xlfn.MINIFS($A$12:$A$454,$B$12:$B$454,$B$2))"]];
   sheet.getRange("H3").formulas = [["=IF(K3=0,\"\",_xlfn.MAXIFS($A$12:$A$454,$B$12:$B$454,$B$2))"]];
   sheet.getRange("K3").formulas = [["=COUNTIF($B$12:$B$454,$B$2)"]];
-  sheet.getRange("E4").formulas = [["=IF(K4=0,\"\",_xlfn.MINIFS($N$12:$N$456,$O$12:$O$456,$B$2))"]];
-  sheet.getRange("H4").formulas = [["=IF(K4=0,\"\",_xlfn.MAXIFS($N$12:$N$456,$O$12:$O$456,$B$2))"]];
-  sheet.getRange("K4").formulas = [["=COUNTIF($O$12:$O$456,$B$2)"]];
+  sheet.getRange("E4").formulas = [["=IF(K4=0,\"\",_xlfn.MINIFS($N$12:$N$1000,$O$12:$O$1000,$B$2))"]];
+  sheet.getRange("H4").formulas = [["=IF(K4=0,\"\",_xlfn.MAXIFS($N$12:$N$1000,$O$12:$O$1000,$B$2))"]];
+  sheet.getRange("K4").formulas = [["=COUNTIF($O$12:$O$1000,$B$2)"]];
   sheet.getRange("E5").formulas = [["=IF(K5=0,\"\",_xlfn.MINIFS($AA$12:$AA$500,$AB$12:$AB$500,$B$2))"]];
   sheet.getRange("H5").formulas = [["=IF(K5=0,\"\",_xlfn.MAXIFS($AA$12:$AA$500,$AB$12:$AB$500,$B$2))"]];
   sheet.getRange("K5").formulas = [["=COUNTIF($AB$12:$AB$500,$B$2)"]];
   sheet.getRange("B7").formulas = [["=B3-B4"]];
-  for (const range of ["A12:A454", "N12:N456", "AA12:AA500"]) sheet.getRange(range).format.numberFormat = "yyyy-mm-dd";
-  for (const range of ["F12:F454", "J12:J454", "S12:S456", "W12:W456", "AG12:AG500", "AK12:AL500"]) sheet.getRange(range).format.numberFormat = MONEY;
+  for (const range of ["A12:A454", "N12:N1000", "AA12:AA500"]) sheet.getRange(range).format.numberFormat = "yyyy-mm-dd";
+  for (const range of ["F12:F454", "J12:J454", "S12:S1000", "W12:W1000", "AG12:AG500", "AK12:AL500"]) sheet.getRange(range).format.numberFormat = MONEY;
   for (const col of ["A:J", "N:W", "AA:AM"]) sheet.getRange(col).format.columnWidth = 13;
   sheet.getRange("E:E").format.columnWidth = 20; sheet.getRange("R:R").format.columnWidth = 20; sheet.getRange("AF:AF").format.columnWidth = 20;
 }

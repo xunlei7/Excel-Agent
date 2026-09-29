@@ -22,6 +22,7 @@ For date d:
 - Keep fully sold tickers in the historical price and units matrix even though they no longer appear in current holdings.
 - Do not add weekends or market holidays.
 - Preserve existing dates and prices; append or merge dates in ascending order and reject conflicting prices.
+- In `continue`, preserve verified Bootstrap history before Opening Date as fixed historical snapshots. Freeze it before the first intermediate export so unsupported legacy formulas cannot replace valid historical cash and net-worth cached values. Apply the opening baseline and current formulas only from Opening Date forward.
 - Historical Units Held on d equals Buy units through d minus Sell units through d.
 - Update the table bounds, net-worth chart ranges, and latest-value KPI formulas to the dynamic width and last populated date.
 

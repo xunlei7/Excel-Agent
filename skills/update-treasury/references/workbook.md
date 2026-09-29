@@ -5,7 +5,7 @@
 - `start`: build a new workbook from code and raw inputs.
 - `continue`: explicitly begin with `Output/bootstrap/One_Piece.xlsx`, then run the same modules and remove every non-required sheet.
 - Publish exactly one monthly result at `Output/YYYY-MM/One_Piece_YYYY-MM.xlsx`. Do not create another latest-copy.
-- Derive `YYYY-MM` from the latest accepted 青子记账 date.
+- Derive `YYYY-MM` from the latest accepted CashFlow source date.
 
 Preserve exactly four sheets in this order: `CashFlow`, `Stock`, `Asset`, `Summary`. Do not create a helper or dropdown-options sheet.
 
@@ -34,7 +34,9 @@ Opening Date is the first date whose activity is applied to the explicit opening
 
 Classify files by normalized headers plus folder context, not filename alone.
 
-- `CashFlow/`: 青子记账 exports with `日期, 分类, 备注, 类型, 金额, 货币, 账户`.
+- `CashFlow/Chase_Checking_<last4>` and `Chase_Credit_<last4>`: Chase account exports. Folder identity is authoritative.
+- `CashFlow/Alipay`, `WeChat`, `CITIC_CNY`, and `CITIC_USD`: platform or bank exports. CITIC legacy `.xls` files use the pinned `xlrd` dependency.
+- `CashFlow/cashflow-rules.csv`: private reusable decisions for ambiguous transfers or reimbursements. It must remain outside version control with the rest of `CashFlow/`.
 - `Fidelity/`, `Robinhood/`, `Charles/`, and `IBKR/`: supported statements. The folder is authoritative for Broker and defaults a missing Currency to USD.
 - Project root: optional price CSV or asset snapshot CSV.
 

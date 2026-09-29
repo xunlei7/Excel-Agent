@@ -10,7 +10,7 @@ const JSZip = require("jszip");
 
 // artifact-tool may re-export imported shared formulas incompletely. Convert every
 // formula represented in its workbook model into a normal per-cell OOXML formula.
-export async function saveWorkbookFormulaSafe(workbook, workbookPath) {
+export async function saveWorkbookFormulaSafe(workbook, workbookPath, { restoreFixedText = true } = {}) {
   const expectedFormulas = collectWorkbookFormulas(workbook);
   const exported = await SpreadsheetFile.exportXlsx(workbook);
   const archive = await JSZip.loadAsync(Buffer.from(exported.data));
@@ -39,7 +39,9 @@ export async function saveWorkbookFormulaSafe(workbook, workbookPath) {
       /<(?:[A-Za-z_][\w.-]*:)?c\b(?=[^>]*\br="([A-Z]+\d+)")[^>]*(?:\/>|>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?c>)/g,
       (cellXml, address) => normalizeCellFormulaXml(cellXml, formulaMap.get(address)),
     );
-    worksheetXml = restoreFixedTextForSheet(worksheetXml, name);
+    if (restoreFixedText) {
+      worksheetXml = restoreFixedTextForSheet(worksheetXml, name);
+    }
     archive.file(worksheetPath, worksheetXml);
   }
   await fs.writeFile(workbookPath, await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
@@ -62,7 +64,7 @@ export function restoreFixedTextForSheet(worksheetXml, sheetName) {
     ["A11", "Date"],
     ["B11", "Year-Month"],
     ["C11", "Category"],
-    ["D11", "Tag"],
+    ["D11", "Type"],
     ["E11", "Description"],
     ["F11", "Amount"],
     ["G11", "Currency"],
@@ -72,7 +74,7 @@ export function restoreFixedTextForSheet(worksheetXml, sheetName) {
     ["N11", "Date"],
     ["O11", "Year-Month"],
     ["P11", "Category"],
-    ["Q11", "Tag"],
+    ["Q11", "Type"],
     ["R11", "Description"],
     ["S11", "Amount"],
     ["T11", "Currency"],
@@ -83,7 +85,7 @@ export function restoreFixedTextForSheet(worksheetXml, sheetName) {
     ["AB11", "Year-Month"],
     ["AC11", "Counterparty"],
     ["AD11", "Category"],
-    ["AE11", "Tag"],
+    ["AE11", "Type"],
     ["AF11", "Description"],
     ["AG11", "Amount"],
     ["AH11", "Currency"],

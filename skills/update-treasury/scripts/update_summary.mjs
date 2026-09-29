@@ -47,8 +47,7 @@ export async function runSummaryUpdate({
   const bootstrap = await readBootstrap(path.resolve(inputFile || path.join(inputDir, "monthly-close-input.md")));
   const holdings = readStockHoldings(workbook.worksheets.getItem("Stock"));
   if (!holdings.length) fail(`Stock holdings summary has no tickers at Stock!P${HOLDINGS_FIRST_ROW}:P${HOLDINGS_LAST_ROW}.`);
-  const summarySheet = workbook.worksheets.getItem("Summary");
-  const openingDate = excelDateText(readOpeningAnchor(summarySheet, detectLayout(summarySheet)).date);
+  const openingDate = bootstrap.openingDateText;
 
   const priceSource = priceCsv
     ? { file: path.resolve(priceCsv), fetched: false, fetchReport: null }
@@ -159,8 +158,7 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
   const cashflowColumns = detectCashflowColumns(workbook.worksheets.getItem("CashFlow"));
   const oldLayout = detectLayout(sheet);
   const oldRows = readExistingHistory(sheet, oldLayout);
-  const oldAnchor = readOpeningAnchor(sheet, oldLayout);
-  const openingDate = excelDateText(oldAnchor.date);
+  const openingDate = bootstrap.openingDateText;
   const oldTickers = oldLayout.tickers;
   const names = new Map(holdings.map((item) => [item.ticker, item.name]));
   const displayTickers = new Map(oldLayout.displayTickers.map((ticker, index) => [oldTickers[index], ticker]));
@@ -179,7 +177,9 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
     }
   }
 
-  const rowsByDate = new Map(oldRows.map((item) => [item.date, item]));
+  const rowsByDate = new Map(oldRows
+    .filter((item) => item.date <= requestedDate)
+    .map((item) => [item.date, { ...item, preserveSnapshot: item.date < openingDate }]));
   let addedRows = 0;
   let updatedRows = 0;
   for (const item of incoming) {
@@ -188,7 +188,7 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
     else addedRows += 1;
     const prices = new Map(existing?.prices || []);
     for (const [ticker, quote] of item.prices) prices.set(ticker, quote.price);
-    rowsByDate.set(item.date, { date: item.date, dateValue: item.dateValue, prices });
+    rowsByDate.set(item.date, { date: item.date, dateValue: item.dateValue, prices, preserveSnapshot: false });
   }
   const rows = [...rowsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
   if (rows.length > MAX_DATA_ROW - FIRST_DATA_ROW + 1) fail(`Summary history exceeds row ${MAX_DATA_ROW}.`);
@@ -214,7 +214,7 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
   }
   writeHeaders(sheet, layout, tickers, names, displayTickers, bootstrap);
   writeHistory(sheet, layout, tickers, rows, cashflowColumns, bootstrap);
-  writeOpeningAnchor(sheet, layout, oldAnchor);
+  writeOpeningAnchor(sheet, layout, { date: bootstrap.openingDate, cash: bootstrap.openingCash });
   writeKpis(sheet, layout);
   formatSummary(sheet, layout, rows.length);
 
@@ -224,6 +224,7 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
   // formulas from the former metric column. Reassert that Date and ticker-price
   // columns contain only typed values after the table exists.
   writeDateAndPriceValues(sheet, tickers, rows);
+  writePreservedHistoryValues(sheet, layout, tickers, rows);
   updateChart(sheet, layout, rows.length);
 
   return {
@@ -232,8 +233,8 @@ function updateSummarySheet(workbook, history, holdings, requestedDate, bootstra
     addedTickers: tickers.filter((ticker) => !oldTickers.includes(ticker)),
     names: Object.fromEntries(tickers.map((ticker) => [ticker, names.get(ticker)])),
     tradingDaysInRequestedMonth: incoming.length,
-    tradingDaysInRequestedRange: incoming.length,
-    historyStartDate: openingDate,
+    tradingDaysInRequestedRange: rows.length,
+    historyStartDate: rows.at(0)?.date || openingDate,
     addedRows,
     updatedRows,
     totalHistoryRows: rows.length,
@@ -296,7 +297,7 @@ function makeLayout(tickerCount) {
 }
 
 function readExistingHistory(sheet, layout) {
-  const values = sheet.getRangeByIndexes(FIRST_DATA_ROW - 1, 0, MAX_DATA_ROW - FIRST_DATA_ROW + 1, layout.priceEndCol + 1).values;
+  const values = sheet.getRangeByIndexes(FIRST_DATA_ROW - 1, 0, MAX_DATA_ROW - FIRST_DATA_ROW + 1, layout.cashCol + 1).values;
   const rows = [];
   for (const row of values) {
     const date = excelDateText(row[0]);
@@ -306,7 +307,16 @@ function readExistingHistory(sheet, layout) {
       const price = Number(row[index + 1]);
       if (Number.isFinite(price) && price > 0) prices.set(ticker, price);
     });
-    rows.push({ date, dateValue: new Date(`${date}T00:00:00.000Z`), prices });
+    const units = new Map();
+    layout.tickers.forEach((ticker, index) => units.set(ticker, row[layout.helperStartCol + index]));
+    rows.push({
+      date,
+      dateValue: new Date(`${date}T00:00:00.000Z`),
+      prices,
+      metrics: row.slice(layout.metricStartCol, layout.totalNetWorthCol + 1),
+      units,
+      cash: row[layout.cashCol],
+    });
   }
   return rows;
 }
@@ -364,6 +374,10 @@ function writeHistory(sheet, layout, tickers, rows, cashflowColumns, bootstrap) 
     const total = columnLetter(layout.totalNetWorthCol);
     const cash = columnLetter(layout.cashCol);
     const anchor = columnLetter(layout.anchorValueCol);
+    if (rows[index].preserveSnapshot) {
+      writePreservedHistoryRow(sheet, layout, tickers, row, rows[index]);
+      continue;
+    }
     sheet.getRangeByIndexes(row - 1, layout.metricStartCol, 1, 2).formulas = [[
       `=IF(COUNTA(${priceStart}${row}:${priceEnd}${row})=0,"",SUMPRODUCT(${priceStart}${row}:${priceEnd}${row},${helperStart}${row}:${helperEnd}${row}))`,
       `=${stockUsd}${row}*IF('Asset'!$K$3="USD",1,'Asset'!$K$4)`,
@@ -378,6 +392,24 @@ function writeHistory(sheet, layout, tickers, rows, cashflowColumns, bootstrap) 
     // the calculation cache does not retain a transient #N/A on export.
     sheet.getRange(`${total}${row}`).formulas = [[`=${stockBase}${row}+${cash}${row}`]];
   }
+}
+
+function writePreservedHistoryValues(sheet, layout, tickers, rows) {
+  rows.forEach((item, index) => {
+    if (item.preserveSnapshot) writePreservedHistoryRow(sheet, layout, tickers, FIRST_DATA_ROW + index, item);
+  });
+}
+
+function writePreservedHistoryRow(sheet, layout, tickers, row, item) {
+  const metricRange = sheet.getRangeByIndexes(row - 1, layout.metricStartCol, 1, 3);
+  metricRange.clear({ applyTo: "contents" });
+  metricRange.values = [[...(item.metrics || [null, null, null])]];
+  const unitRange = sheet.getRangeByIndexes(row - 1, layout.helperStartCol, 1, tickers.length);
+  unitRange.clear({ applyTo: "contents" });
+  unitRange.values = [[...tickers.map((ticker) => item.units?.get(ticker) ?? null)]];
+  const cashCell = sheet.getRangeByIndexes(row - 1, layout.cashCol, 1, 1);
+  cashCell.clear({ applyTo: "contents" });
+  cashCell.values = [[item.cash ?? null]];
 }
 
 function writeDateAndPriceValues(sheet, tickers, rows) {

@@ -131,7 +131,7 @@ export function updateAssetSheet(workbook, snapshot) {
     asset.getRange(`G${target.row}`).values = [[holding.bucket]];
     asset.getRange(`D${target.row}`).formulas = [[`='Stock'!V${holding.row}`]];
     writeFxAndConvertedFormulas(asset, target.row);
-    asset.getRange(`H${target.row}`).formulas = [[`='Stock'!S${price.row}`]];
+    asset.getRange(`H${target.row}`).formulas = [[`=IF('Stock'!S${price.row}="","",'Stock'!S${price.row})`]];
     formatDetailRow(asset, target.row);
     linkedSecurities.push({ ticker: holding.ticker, assetRow: target.row, stockHoldingRow: holding.row, stockPriceRow: price.row });
   }

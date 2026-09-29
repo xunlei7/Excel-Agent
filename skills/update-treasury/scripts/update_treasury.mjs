@@ -23,6 +23,9 @@ export async function runTreasuryUpdate({
   cashflowCsvs = [],
   stockSources = [],
   throughDate = null,
+  cashflowCacheDir = null,
+  useCashflowCache = true,
+  refreshCashflowCache = false,
   priceCsv = null,
   statementCacheDir = null,
   useStatementCache = true,
@@ -54,6 +57,9 @@ export async function runTreasuryUpdate({
       cashflowDir: path.join(root, "CashFlow"),
       cashflowCsvs,
       throughDate: cashflowCutoff,
+      cacheDir: cashflowCacheDir,
+      useCache: useCashflowCache,
+      refreshCache: refreshCashflowCache,
     });
     const closeDate = latestCashflowDate(cashflow);
     const closeMonth = closeDate.slice(0, 7);
@@ -161,6 +167,8 @@ function parseCliArgs(argv) {
     "--allow-existing-output",
     "--no-statement-cache",
     "--refresh-statement-cache",
+    "--no-cashflow-cache",
+    "--refresh-cashflow-cache",
     "--skip-stock-price-fetch",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
@@ -190,6 +198,9 @@ function usage() {
     "  --bootstrap-workbook FILE        Bootstrap source for continue mode",
     "  --output FILE                   Override Output/YYYY-MM/One_Piece_YYYY-MM.xlsx",
     "  --through-date YYYY-MM-DD        Ignore later CashFlow rows",
+    "  --cashflow-cache-dir DIR         CashFlow parse-cache location",
+    "  --no-cashflow-cache              Reparse every CashFlow source",
+    "  --refresh-cashflow-cache         Refresh cached CashFlow parses",
     "  --price-csv FILE                 Use supplied Summary daily prices",
     "  --statement-cache-dir DIR        Brokerage statement cache location",
     "  --no-statement-cache             Reparse every brokerage statement",
@@ -216,6 +227,9 @@ async function main() {
     inputFile: args.inputFile || path.join(inputDir, "monthly-close-input.md"),
     outputPath: args.output || null,
     throughDate: args.throughDate || null,
+    cashflowCacheDir: args.cashflowCacheDir || null,
+    useCashflowCache: !args.noCashflowCache,
+    refreshCashflowCache: Boolean(args.refreshCashflowCache),
     priceCsv: args.priceCsv || null,
     statementCacheDir: args.statementCacheDir || null,
     useStatementCache: !args.noStatementCache,

@@ -22,13 +22,17 @@ The public [assets/One_Piece_Template.xlsx](assets/One_Piece_Template.xlsx) work
 
 - Run `scripts/import_cashflow.mjs` for CashFlow-only updates. The main `scripts/update_treasury.mjs` entry point imports and reuses the same implementation.
 - For fast visual testing, pass `--cashflow-only`. It creates a temporary workbook from code, runs only the CashFlow importer, and creates a standalone workbook containing one sheet. This preview must not be used as a monthly-close archive.
-- Read every recognized 青子记账 CSV in `CashFlow/` and normalize whitespace, dates, currencies, and account aliases.
+- Read account exports from `CashFlow/Chase_Checking_<last4>`, `Chase_Credit_<last4>`, `Alipay`, `WeChat`, `CITIC_CNY`, and `CITIC_USD`. The folder determines the account; do not infer it from a filename.
+- Preserve CashFlow rows through 2026-07-31. Rebuild rows on or after 2026-08-01 from these source exports, so retained 青子记账 files cannot duplicate the new account-ledger import.
 - In a complete close, use `As-of Date` from `monthly-close-input.md` as the default CashFlow cutoff. Report later source rows as excluded; do not let them move the workbook into the next close month. An explicit `--through-date` overrides this cutoff.
-- Split records by `类型` and process in this order: `Income`, `Expense`, `Transfer`.
+- Map the source transaction type to the workbook `Type` field, classify each record as `Income`, `Expense`, `Transfer`, or ignored settlement, and process the three imported blocks in that order.
+- Keep dates only in the Date and Year-Month columns. Do not append or repeat a transaction date in Description or Counterparty.
 - Sort each block by date ascending, then append it in the matching CashFlow block using that block's formulas and formatting.
-- Reconcile duplicates by occurrence count so accumulated CSV files do not re-import old records and legitimate identical transactions are retained.
+- Apply explicit ambiguous-transaction rules from the private `CashFlow/cashflow-rules.csv`. Stop and report unmatched personal transfers instead of guessing; a confirmed rule can be reused in later closes.
+- Cache normalized source parses by file content in `.cache/update-treasury/cashflow-sources/`. Unchanged files use the cache; new, changed, corrupt-cache, or parser-version-mismatched files are parsed again. The cache is derived and may be deleted safely.
+- Reconcile overlapping exports by normalized transaction occurrence count. Across files, retain the maximum number of identical occurrences found in any one file, so accumulated exports do not duplicate old rows while legitimate repeated transactions within one export remain.
 - Transfer rows require a reliable Counterparty. Use the mapping reference; if the required source field is blank, stop and identify the rows instead of guessing.
-- Reconcile every source row to exactly one of: imported, skipped as an existing occurrence, or rejected with a stated reason.
+- Reconcile every source row to exactly one of: imported, excluded after the cutoff, skipped as a duplicate occurrence, ignored settlement, or rejected with a stated reason.
 
 ### 2. Import brokerage activity and update Stock
 
@@ -43,7 +47,7 @@ The public [assets/One_Piece_Template.xlsx](assets/One_Piece_Template.xlsx) work
 - Reconcile duplicates by occurrence count, then sort the complete Stock transaction ledger—not only newly accepted rows—by trade/activity date ascending from January through December.
 - Update `持仓汇总（按当前市值）` from the complete transaction ledger, not from the brokerage CSV's ending snapshot.
 - Start holdings, total cost, and cumulative realized P/L from the explicit opening-holdings table, then apply only transactions on or after Opening Date. This baseline replaces earlier activity that is not available as raw statements.
-- Update `当前价格输入（可手动更新）` by calling `scripts/fetch_stock_prices.py` for every modeled ticker and using the latest complete common price date. In Stock-only mode, derive the cutoff from the latest recognized CashFlow CSV date unless `--price-as-of` is supplied; use `--skip-price-fetch` only for an explicit offline test.
+- Update `当前价格输入（可手动更新）` by calling `scripts/fetch_stock_prices.py` for every modeled ticker and using the latest complete common price date. In Stock-only mode, supply `--price-as-of`; the complete-close orchestrator passes the accepted CashFlow cutoff automatically. Use `--skip-price-fetch` only for an explicit offline test.
 
 #### New stock or ETF
 

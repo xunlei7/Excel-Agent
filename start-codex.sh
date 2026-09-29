@@ -27,8 +27,8 @@ if [[ -z "$python_binary" || ! -x "$python_binary" ]]; then
   exit 1
 fi
 
-if ! "$python_binary" -c 'import yfinance' >/dev/null 2>&1; then
-  echo "Conda money 环境缺少 yfinance：$python_binary" >&2
+if ! "$python_binary" -c 'import yfinance, xlrd' >/dev/null 2>&1; then
+  echo "Python 环境缺少 yfinance 或 xlrd；请安装 skills/update-treasury/requirements.txt：$python_binary" >&2
   exit 1
 fi
 

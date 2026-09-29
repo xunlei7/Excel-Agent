@@ -7,12 +7,12 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { createTreasuryWorkbook } from "./create_workbook.mjs";
 import { saveWorkbookFormulaSafe } from "./workbook_io.mjs";
+import { discoverAccountCashflowSources, parseAccountCashflowSources, readCashflowRules } from "./cashflow_sources.mjs";
 
 const dependencies = process.env.CODEX_NODE_MODULES;
 if (!dependencies) throw new Error("CODEX_NODE_MODULES is required");
 const require = createRequire(path.join(dependencies, "package.json"));
 const { FileBlob, SpreadsheetFile, Workbook } = require("@oai/artifact-tool");
-const JSZip = require("jszip");
 
 const REQUIRED_CASHFLOW_HEADERS = ["日期", "分类", "备注", "类型", "金额", "货币", "账户"];
 const SUPPORTED_ACCOUNTS = new Set([
@@ -39,11 +39,17 @@ const ACCOUNT_CURRENCIES = new Map([
 
 const CASHFLOW_BLOCKS = {
   income: { startRow: 12, endRow: 454, startCol: 0, sourceWidth: 8 },
-  expense: { startRow: 12, endRow: 456, startCol: 13, sourceWidth: 8 },
+  expense: { startRow: 12, endRow: 1000, startCol: 13, sourceWidth: 8 },
   transfer: { startRow: 12, endRow: 500, startCol: 26, sourceWidth: 9 },
 };
 
 const COMPACT_HEADERS = {
+  income: ["Date", "Year-Month", "Category", "Type", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"],
+  expense: ["Date", "Year-Month", "Category", "Type", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"],
+  transfer: ["Date", "Year-Month", "Counterparty", "Category", "Type", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount", "Outstanding", "Status"],
+};
+
+const PREVIOUS_COMPACT_HEADERS = {
   income: ["Date", "Year-Month", "Category", "Tag", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"],
   expense: ["Date", "Year-Month", "Category", "Tag", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount"],
   transfer: ["Date", "Year-Month", "Counterparty", "Category", "Tag", "Description", "Amount", "Currency", "Account", "FX Rate", "Converted Amount", "Outstanding", "Status"],
@@ -195,7 +201,19 @@ export async function importCashflow(workbook, csvPath, { fxRates = null, throug
   };
 }
 
-export async function runCashflowImport({ workbookPath, outputPath, cashflowDir, cashflowCsvs = [], throughDate = null, dryRun = false, allowExistingOutput = false, cashflowOnly = false }) {
+export async function runCashflowImport({
+  workbookPath,
+  outputPath,
+  cashflowDir,
+  cashflowCsvs = [],
+  throughDate = null,
+  dryRun = false,
+  allowExistingOutput = false,
+  cashflowOnly = false,
+  cacheDir = null,
+  useCache = true,
+  refreshCache = false,
+}) {
   const sourceWorkbook = path.resolve(workbookPath);
   const destinationWorkbook = path.resolve(outputPath);
   if (sourceWorkbook === destinationWorkbook) fail("Refusing to overwrite the source workbook. Choose a distinct output path.");
@@ -203,14 +221,69 @@ export async function runCashflowImport({ workbookPath, outputPath, cashflowDir,
 
   let discovery = null;
   let sources = cashflowCsvs.map((file) => path.resolve(file));
+  const workbook = await SpreadsheetFile.importXlsx(await FileBlob.load(sourceWorkbook));
+  const cashflowSheet = ensureCompactCashflowLayout(workbook);
+  const fxRates = cashflowOnly ? inferCashflowFxRates(cashflowSheet, workbook) : null;
+  const resolvedCacheDir = path.resolve(cacheDir || path.join(path.dirname(path.resolve(cashflowDir)), ".cache", "update-treasury", "cashflow-sources"));
+
   if (!sources.length) {
+    const accountDiscovery = await discoverAccountCashflowSources(cashflowDir);
+    if (accountDiscovery.recognized.length) {
+      if (!throughDate) fail("Account-based CashFlow import requires --through-date YYYY-MM-DD.");
+      const ruleSet = await readCashflowRules(cashflowDir);
+      const parsed = await parseAccountCashflowSources(accountDiscovery.recognized, {
+        FileBlob,
+        SpreadsheetFile,
+        throughDate,
+        rules: ruleSet.rules,
+        cacheDir: resolvedCacheDir,
+        useCache,
+        refreshCache,
+      });
+      clearCashflowOnOrAfter(cashflowSheet, "2026-08-01");
+      const append = {};
+      for (const kind of ["income", "expense", "transfer"]) {
+        const incoming = parsed.items[kind].map((item) => ({ ...item, key: keyOf(item.keyParts) }));
+        append[kind] = appendCashBlock(cashflowSheet, incoming, kind, fxRates);
+      }
+      const latestAcceptedDate = parsed.files.map((file) => file.latestDate).filter(Boolean).sort().at(-1) || null;
+      if (latestAcceptedDate) cashflowSheet.getRange("B2").values = [[latestAcceptedDate.slice(0, 7)]];
+      if (cashflowOnly) {
+        refreshStandaloneTransferStatus(cashflowSheet);
+        prepareCashflowOnlyPreview(workbook);
+      }
+      if (!dryRun) {
+        await fs.mkdir(path.dirname(destinationWorkbook), { recursive: true });
+        await saveCashflowWorkbook(workbook, destinationWorkbook);
+      }
+      return {
+        workbook: sourceWorkbook,
+        output: dryRun ? null : destinationWorkbook,
+        cashflowDirectory: accountDiscovery.directory,
+        recognizedFiles: accountDiscovery.recognized.map((source) => source.file),
+        ignoredFiles: accountDiscovery.ignored,
+        rulesFile: ruleSet.file,
+        usedRuleRows: parsed.usedRuleRows,
+        rebuildFromDate: "2026-08-01",
+        cashflowCache: summarizeCashflowCache(parsed.files, resolvedCacheDir, useCache),
+        cashflowOnly,
+        files: parsed.files,
+        totals: {
+          sourceFiles: parsed.files.length,
+          sourceRows: parsed.files.reduce((sum, file) => sum + file.sourceRows, 0),
+          excludedAfterCutoff: parsed.files.reduce((sum, file) => sum + file.excludedAfterCutoff, 0),
+          skippedDuplicateOccurrences: parsed.duplicateOccurrences,
+          latestDate: latestAcceptedDate,
+          income: { sourceRecords: parsed.items.income.length, ...append.income },
+          expense: { sourceRecords: parsed.items.expense.length, ...append.expense },
+          transfer: { sourceRecords: parsed.items.transfer.length, ...append.transfer },
+        },
+      };
+    }
     discovery = await discoverCashflowCsvs(cashflowDir);
     sources = discovery.recognized;
   }
 
-  const workbook = await SpreadsheetFile.importXlsx(await FileBlob.load(sourceWorkbook));
-  const cashflowSheet = ensureCompactCashflowLayout(workbook);
-  const fxRates = cashflowOnly ? inferCashflowFxRates(cashflowSheet) : null;
   const reports = [];
   for (const source of sources) reports.push(await importCashflow(workbook, source, { fxRates, throughDate }));
   const latestAcceptedDate = reports.map((report) => report.latestDate).filter(Boolean).sort().at(-1) || null;
@@ -239,45 +312,11 @@ export async function runCashflowImport({ workbookPath, outputPath, cashflowDir,
 
 export async function saveCashflowWorkbook(workbook, destinationWorkbook) {
   await saveWorkbookFormulaSafe(workbook, destinationWorkbook);
-  const exportedBytes = await fs.readFile(destinationWorkbook);
-  const cleanedBytes = await removeLegacyCashflowColumnAn(exportedBytes);
-  await fs.writeFile(destinationWorkbook, cleanedBytes);
-}
-
-async function removeLegacyCashflowColumnAn(xlsxBytes) {
-  const archive = await JSZip.loadAsync(xlsxBytes);
-  const workbookXml = await archive.file("xl/workbook.xml")?.async("string");
-  const relationshipsXml = await archive.file("xl/_rels/workbook.xml.rels")?.async("string");
-  if (!workbookXml || !relationshipsXml) fail("Exported workbook is missing its workbook metadata.");
-
-  const cashflowSheetTag = [...workbookXml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?sheet\b[^>]*>/g)]
-    .map((match) => match[0])
-    .find((tag) => /\bname="CashFlow"/.test(tag));
-  const relationshipId = cashflowSheetTag?.match(/\br:id="([^"]+)"/)?.[1];
-  if (!relationshipId) fail("Exported workbook is missing the CashFlow worksheet relationship.");
-
-  const relationshipTag = [...relationshipsXml.matchAll(/<Relationship\b[^>]*>/g)]
-    .map((match) => match[0])
-    .find((tag) => new RegExp(`\\bId="${relationshipId}"`).test(tag));
-  const target = relationshipTag?.match(/\bTarget="([^"]+)"/)?.[1];
-  if (!target) fail("Exported workbook is missing the CashFlow worksheet target.");
-
-  const worksheetPath = target.startsWith("/")
-    ? target.slice(1)
-    : path.posix.normalize(path.posix.join("xl", target));
-  const worksheetFile = archive.file(worksheetPath);
-  if (!worksheetFile) fail(`Exported workbook is missing ${worksheetPath}.`);
-
-  let worksheetXml = await worksheetFile.async("string");
-  worksheetXml = worksheetXml.replace(/<(?:[A-Za-z_][\w.-]*:)?c\b(?=[^>]*\br="AN[1-9]\d*")[^>]*(?:\/>|>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?c>)/g, "");
-  worksheetXml = worksheetXml.replace(/(<(?:[A-Za-z_][\w.-]*:)?dimension\b[^>]*\bref="[^"]*:)(AN)([1-9]\d*"[^>]*>)/, "$1AM$3");
-  archive.file(worksheetPath, worksheetXml);
-  return archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
 
 function prepareCashflowOnlyPreview(workbook) {
   const cashflow = workbook.worksheets.getItem("CashFlow");
-  for (const address of ["I12:J454", "V12:W456", "AJ12:AK500"]) {
+  for (const address of ["I12:J454", "V12:W1000", "AJ12:AK500"]) {
     const range = cashflow.getRange(address);
     range.values = range.values;
   }
@@ -301,15 +340,29 @@ function listSheetNames(workbook) {
   return names;
 }
 
-function inferCashflowFxRates(sheet) {
+function inferCashflowFxRates(sheet, workbook) {
   const rates = new Map();
-  for (const [currencyRange, rateRange] of [["G12:G454", "I12:I454"], ["T12:T456", "V12:V456"], ["AH12:AH500", "AJ12:AJ500"]]) {
+  for (const [currencyRange, rateRange] of [["G12:G454", "I12:I454"], ["T12:T1000", "V12:V1000"], ["AH12:AH500", "AJ12:AJ500"]]) {
     const currencies = sheet.getRange(currencyRange).values;
     const values = sheet.getRange(rateRange).values;
     for (let index = currencies.length - 1; index >= 0; index -= 1) {
       const currency = clean(currencies[index][0]).toUpperCase();
       const rate = Number(values[index][0]);
       if (currency && Number.isFinite(rate) && rate > 0 && !rates.has(currency)) rates.set(currency, rate);
+    }
+  }
+  if (hasWorksheet(workbook, "Asset")) {
+    const asset = workbook.worksheets.getItem("Asset");
+    const baseCurrency = clean(asset.getRange("K3").values[0][0]).toUpperCase();
+    const usdCny = Number(asset.getRange("K4").values[0][0]);
+    if (Number.isFinite(usdCny) && usdCny > 0) {
+      if (baseCurrency === "USD") {
+        if (!rates.has("USD")) rates.set("USD", 1);
+        if (!rates.has("CNY")) rates.set("CNY", 1 / usdCny);
+      } else if (baseCurrency === "CNY") {
+        if (!rates.has("CNY")) rates.set("CNY", 1);
+        if (!rates.has("USD")) rates.set("USD", usdCny);
+      }
     }
   }
   if (!rates.size) fail("CashFlow-only template does not contain usable FX rates.");
@@ -333,7 +386,7 @@ function refreshStandaloneTransferStatus(sheet) {
     if (!counterparty || seen.has(counterparty)) return [null, null];
     seen.add(counterparty);
     const outstanding = totals.get(counterparty) || 0;
-    const status = outstanding === 0 ? "Settled" : outstanding < 0 ? "Owes You" : "You Owe";
+    const status = Math.abs(outstanding) < 0.005 ? "Settled" : outstanding < 0 ? "Owes You" : "You Owe";
     return [outstanding, status];
   });
   sheet.getRange("AL12:AM500").values = statusRows;
@@ -342,7 +395,9 @@ function refreshStandaloneTransferStatus(sheet) {
 export function ensureCompactCashflowLayout(workbook) {
   const sheet = workbook.worksheets.getItem("CashFlow");
   const incomeHeaders = sheet.getRange("A11:L11").values[0].map(clean);
-  const alreadyCompact = JSON.stringify(incomeHeaders.slice(0, 10)) === JSON.stringify(COMPACT_HEADERS.income);
+  const compactHeader = incomeHeaders.slice(0, 10);
+  const alreadyCompact = [COMPACT_HEADERS.income, PREVIOUS_COMPACT_HEADERS.income]
+    .some((expected) => JSON.stringify(compactHeader) === JSON.stringify(expected));
 
   if (!alreadyCompact) {
     const legacyIncome = ["Date", "Year-Month", "Book", "Category", "Tag", "Description", "Amount", "Currency", "Account", "Notes", "FX Rate", "Converted Amount"];
@@ -352,9 +407,9 @@ export function ensureCompactCashflowLayout(workbook) {
     assertHeaders(sheet, "N11:Y11", legacyExpense);
     assertHeaders(sheet, "AA11:AN11", legacyTransfer);
 
-    compactBlock(sheet, ["A", "B", "D", "E", "F", "G", "H", "I", "K", "L"], ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"], "K11:L500");
-    compactBlock(sheet, ["N", "O", "Q", "R", "S", "T", "U", "V", "X", "Y"], ["N", "O", "P", "Q", "R", "S", "T", "U", "V", "W"], "X11:Y500");
-    compactBlock(sheet, ["AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AK", "AL", "AM", "AN"], ["AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM"], "AN11:AN500");
+    compactBlock(sheet, ["A", "B", "D", "E", "F", "G", "H", "I", "K", "L"], ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"], "K11:L1000", "A12:L500");
+    compactBlock(sheet, ["N", "O", "Q", "R", "S", "T", "U", "V", "X", "Y"], ["N", "O", "P", "Q", "R", "S", "T", "U", "V", "W"], "X11:Y1000", "N12:Y1000");
+    compactBlock(sheet, ["AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AK", "AL", "AM", "AN"], ["AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM"], "AN11:AN1000", "AA12:AN500");
 
     sheet.unmergeCells("A10:L10");
     sheet.unmergeCells("N10:Y10");
@@ -377,11 +432,11 @@ export function ensureCompactCashflowLayout(workbook) {
   rewriteCashflowSummaryFormulas(sheet);
   formatCashflowHeaders(sheet);
   formatExistingCashflowRows(sheet);
-  sheet.getRange("K10:L10").clear({ applyTo: "all" });
-  sheet.getRange("X10:Y10").clear({ applyTo: "all" });
+  sheet.getRange("K10:L1000").clear({ applyTo: "all" });
+  sheet.getRange("X10:Y1000").clear({ applyTo: "all" });
   // Status now lives in AM. The exported XLSX is stripped of all legacy AN
   // cells by saveCashflowWorkbook, including formulas retained by importers.
-  sheet.getRange("AN10:AN10").clear({ applyTo: "all" });
+  sheet.getRange("AN10:AN1000").clear({ applyTo: "all" });
   if (!hasWorksheet(workbook, "Asset")) refreshStandaloneDerivedValues(sheet);
   return sheet;
 }
@@ -404,7 +459,7 @@ function formatCashflowHeaders(sheet) {
 function refreshStandaloneDerivedValues(sheet) {
   for (const [amountColumn, rateColumn, convertedColumn, startRow, endRow] of [
     ["F", "I", "J", 12, 454],
-    ["S", "V", "W", 12, 456],
+    ["S", "V", "W", 12, 1000],
     ["AG", "AJ", "AK", 12, 500],
   ]) {
     const amounts = sheet.getRange(`${amountColumn}${startRow}:${amountColumn}${endRow}`).values;
@@ -419,8 +474,12 @@ function refreshStandaloneDerivedValues(sheet) {
   refreshStandaloneTransferStatus(sheet);
 }
 
-function compactBlock(sheet, sourceColumns, destinationColumns, tailRange) {
+function compactBlock(sheet, sourceColumns, destinationColumns, tailRange, legacyDataRange) {
   const snapshots = sourceColumns.map((column) => sheet.getRange(`${column}11:${column}500`).values);
+  // The verified legacy workbook vertically merged repeated dates and labels.
+  // Read first so the workbook model expands each merged value, then unmerge
+  // before writing the compact columns so every transaction row is explicit.
+  sheet.getRange(legacyDataRange).unmerge();
   for (let index = 0; index < sourceColumns.length; index += 1) {
     if (sourceColumns[index] === destinationColumns[index]) continue;
     sheet.getRange(`${destinationColumns[index]}11:${destinationColumns[index]}500`).copyFrom(
@@ -442,14 +501,14 @@ function rewriteCashflowSummaryFormulas(sheet) {
   sheet.getRange("J3:J5").values = [["Income Record Count"], ["Expense Record Count"], ["Transfer Record Count"]];
   sheet.getRange("A7").values = [["Net Cash Flow"]];
   sheet.getRange("B3").formulas = [[`=SUMIFS($J$12:$J$454,$A$12:$A$454,">="&DATEVALUE($B$2&"-01"),$A$12:$A$454,"<="&EOMONTH(DATEVALUE($B$2&"-01"),0))`]];
-  sheet.getRange("B4").formulas = [[`=SUMIFS($W$12:$W$456,$N$12:$N$456,">="&DATEVALUE($B$2&"-01"),$N$12:$N$456,"<="&EOMONTH(DATEVALUE($B$2&"-01"),0))`]];
+  sheet.getRange("B4").formulas = [[`=SUMIFS($W$12:$W$1000,$N$12:$N$1000,">="&DATEVALUE($B$2&"-01"),$N$12:$N$1000,"<="&EOMONTH(DATEVALUE($B$2&"-01"),0))`]];
   sheet.getRange("B5").formulas = [[`=SUMIFS($AK$12:$AK$500,$AB$12:$AB$500,$B$2)`]];
   sheet.getRange("E3").formulas = [[`=IF(K3=0,"",_xlfn.MINIFS($A$12:$A$454,$B$12:$B$454,$B$2))`]];
   sheet.getRange("H3").formulas = [[`=IF(K3=0,"",_xlfn.MAXIFS($A$12:$A$454,$B$12:$B$454,$B$2))`]];
   sheet.getRange("K3").formulas = [[`=COUNTIF($B$12:$B$454,$B$2)`]];
-  sheet.getRange("E4").formulas = [[`=IF(K4=0,"",_xlfn.MINIFS($N$12:$N$456,$O$12:$O$456,$B$2))`]];
-  sheet.getRange("H4").formulas = [[`=IF(K4=0,"",_xlfn.MAXIFS($N$12:$N$456,$O$12:$O$456,$B$2))`]];
-  sheet.getRange("K4").formulas = [[`=COUNTIF($O$12:$O$456,$B$2)`]];
+  sheet.getRange("E4").formulas = [[`=IF(K4=0,"",_xlfn.MINIFS($N$12:$N$1000,$O$12:$O$1000,$B$2))`]];
+  sheet.getRange("H4").formulas = [[`=IF(K4=0,"",_xlfn.MAXIFS($N$12:$N$1000,$O$12:$O$1000,$B$2))`]];
+  sheet.getRange("K4").formulas = [[`=COUNTIF($O$12:$O$1000,$B$2)`]];
   sheet.getRange("E5").formulas = [[`=IF(K5=0,"",_xlfn.MINIFS($AA$12:$AA$500,$AB$12:$AB$500,$B$2))`]];
   sheet.getRange("H5").formulas = [[`=IF(K5=0,"",_xlfn.MAXIFS($AA$12:$AA$500,$AB$12:$AB$500,$B$2))`]];
   sheet.getRange("K5").formulas = [[`=COUNTIF($AB$12:$AB$500,$B$2)`]];
@@ -496,6 +555,27 @@ function hasWorksheet(workbook, name) {
   return listSheetNames(workbook).includes(name);
 }
 
+function clearCashflowOnOrAfter(sheet, rebuildFromDate) {
+  for (const kind of ["income", "expense", "transfer"]) {
+    const config = CASHFLOW_BLOCKS[kind];
+    const width = kind === "transfer" ? 13 : 10;
+    const dates = sheet.getRangeByIndexes(config.startRow - 1, config.startCol, config.endRow - config.startRow + 1, 1).values;
+    let previousDate = null;
+    let firstRowToClear = null;
+    for (let index = 0; index < dates.length; index += 1) {
+      const raw = dates[index][0];
+      if (raw === null || raw === "") continue;
+      const date = excelDateText(raw);
+      if (previousDate && date < previousDate) fail(`${kind} CashFlow rows must be sorted by Date before rebuilding from ${rebuildFromDate}.`);
+      previousDate = date;
+      if (firstRowToClear === null && date >= rebuildFromDate) firstRowToClear = config.startRow + index;
+    }
+    if (firstRowToClear !== null) {
+      sheet.getRangeByIndexes(firstRowToClear - 1, config.startCol, config.endRow - firstRowToClear + 1, width).clear({ applyTo: "contents" });
+    }
+  }
+}
+
 function appendCashBlock(sheet, incoming, kind, fxRates = null) {
   const config = CASHFLOW_BLOCKS[kind];
   const existingRange = sheet.getRangeByIndexes(config.startRow - 1, config.startCol, config.endRow - config.startRow + 1, config.sourceWidth);
@@ -523,7 +603,7 @@ function appendCashBlock(sheet, incoming, kind, fxRates = null) {
     const occurrence = (seen.get(item.key) || 0) + 1;
     seen.set(item.key, occurrence);
     if (occurrence <= (counts.get(item.key) || 0)) skippedDuplicates += 1;
-    else rowsToAdd.push(item.values);
+    else rowsToAdd.push(item);
   }
 
   const firstRow = lastRow + 1;
@@ -531,7 +611,7 @@ function appendCashBlock(sheet, incoming, kind, fxRates = null) {
   if (requiredLastRow > config.endRow) fail(`${kind} block capacity exceeded; requires row ${requiredLastRow}, limit is ${config.endRow}.`);
 
   if (rowsToAdd.length) {
-    sheet.getRangeByIndexes(firstRow - 1, config.startCol, rowsToAdd.length, config.sourceWidth).values = rowsToAdd;
+    sheet.getRangeByIndexes(firstRow - 1, config.startCol, rowsToAdd.length, config.sourceWidth).values = rowsToAdd.map((item) => item.values);
     writeCashflowFormulas(sheet, firstRow, rowsToAdd.length, kind, rowsToAdd, fxRates);
     formatCashRows(sheet, firstRow, rowsToAdd.length, kind);
   }
@@ -549,9 +629,10 @@ function writeCashflowFormulas(sheet, firstRow, count, kind, sourceRows, fxRates
   if (fxRates) {
     const amountIndex = kind === "transfer" ? 6 : 5;
     const currencyIndex = kind === "transfer" ? 7 : 6;
-    const converted = sourceRows.map((row) => {
+    const converted = sourceRows.map((item) => {
+      const row = item.values || item;
       const currency = clean(row[currencyIndex]).toUpperCase();
-      const rate = fxRates.get(currency);
+      const rate = Number.isFinite(item.fxRate) ? item.fxRate : fxRates.get(currency);
       if (!rate) fail(`CashFlow-only template is missing an FX rate for ${currency}.`);
       return [rate, row[amountIndex] * rate];
     });
@@ -581,10 +662,16 @@ function writeCashflowFormulas(sheet, firstRow, count, kind, sourceRows, fxRates
       return [
         `=IF(AH${row}="","",IF(AH${row}='Asset'!$K$3,1,IF(AND(AH${row}="USD",'Asset'!$K$3="CNY"),'Asset'!$K$4,IF(AND(AH${row}="CNY",'Asset'!$K$3="USD"),1/'Asset'!$K$4,""))))`,
         `=IF(OR(AG${row}="",AJ${row}=""),"",AG${row}*AJ${row})`,
-        `=IF(COUNTIF($AC$12:AC${row},AC${row})>1,"",SUMIFS($AK$12:$AK$500,$AC$12:$AC$500,AC${row}))`,
+        `=IF(COUNTIF($AC$12:AC${row},AC${row})>1,"",ROUND(SUMIFS($AK$12:$AK$500,$AC$12:$AC$500,AC${row}),2))`,
         `=IF(AL${row}="","",IF(AL${row}=0,"Settled",IF(AL${row}<0,"Owes You","You Owe")))`,
       ];
     });
+    for (let index = 0; index < sourceRows.length; index += 1) {
+      const item = sourceRows[index];
+      if (!Number.isFinite(item.fxRate)) continue;
+      const row = firstRow + index;
+      sheet.getRange(`AJ${row}:AK${row}`).values = [[item.fxRate, item.values[6] * item.fxRate]];
+    }
   }
 }
 
@@ -663,6 +750,15 @@ function aggregateReports(reports) {
   return total;
 }
 
+function summarizeCashflowCache(files, cacheDir, enabled) {
+  const statuses = { hit: 0, miss: 0, refreshed: 0, repaired: 0, disabled: 0 };
+  for (const file of files) {
+    const status = file.cache?.status || "disabled";
+    statuses[status] = (statuses[status] || 0) + 1;
+  }
+  return { enabled, directory: enabled ? cacheDir : null, ...statuses };
+}
+
 function parseCliArgs(argv) {
   const args = { cashflowCsvs: [] };
   for (let index = 0; index < argv.length; index += 1) {
@@ -670,6 +766,8 @@ function parseCliArgs(argv) {
     if (key === "--dry-run") args.dryRun = true;
     else if (key === "--allow-existing-output") args.allowExistingOutput = true;
     else if (key === "--cashflow-only") args.cashflowOnly = true;
+    else if (key === "--no-cashflow-cache") args.noCashflowCache = true;
+    else if (key === "--refresh-cashflow-cache") args.refreshCashflowCache = true;
     else if (key === "--cashflow-csv") args.cashflowCsvs.push(argv[++index]);
     else if (key.startsWith("--")) args[key.slice(2).replace(/-([a-z])/g, (_, character) => character.toUpperCase())] = argv[++index];
     else fail(`Unexpected argument: ${key}`);
@@ -755,7 +853,7 @@ async function main() {
   }
   const cashflowDir = args.cashflowDir || path.join(inputDir, "CashFlow");
   if (!args.output) {
-    fail("Usage: import_cashflow.mjs [--input-dir DIR] [--workbook FILE] --output FILE [--cashflow-dir DIR] [--cashflow-csv FILE ...] [--through-date YYYY-MM-DD] [--cashflow-only] [--dry-run] [--allow-existing-output]");
+    fail("Usage: import_cashflow.mjs [--input-dir DIR] [--workbook FILE] --output FILE [--cashflow-dir DIR] [--cashflow-csv FILE ...] [--through-date YYYY-MM-DD] [--cashflow-cache-dir DIR] [--no-cashflow-cache] [--refresh-cashflow-cache] [--cashflow-only] [--dry-run] [--allow-existing-output]");
   }
   const report = await runCashflowImport({
     workbookPath,
@@ -766,6 +864,9 @@ async function main() {
     dryRun: Boolean(args.dryRun),
     allowExistingOutput: Boolean(args.allowExistingOutput),
     cashflowOnly,
+    cacheDir: args.cashflowCacheDir || null,
+    useCache: !args.noCashflowCache,
+    refreshCache: Boolean(args.refreshCashflowCache),
   });
   console.log(JSON.stringify(report, null, 2));
 }

@@ -57,7 +57,12 @@ export async function runWorkbookFormat({ workbookPath, outputPath, allowExistin
 
 function formatCashflow(sheet) {
   sheet.showGridLines = false;
-  const cashflowCanvas = sheet.getRange("A1:AN500");
+  // Compact CashFlow uses A:J, N:W, and AA:AM. Remove the legacy Book/Note
+  // tails so imported template formatting cannot leave duplicate headers.
+  for (const address of ["K10:L1000", "X10:Y1000", "AN10:AN1000"]) {
+    sheet.getRange(address).clear({ applyTo: "all" });
+  }
+  const cashflowCanvas = sheet.getRange("A1:AN1000");
   cashflowCanvas.format.font = { name: BODY, size: 10, color: BLACK };
   cashflowCanvas.format.horizontalAlignment = "center";
   cashflowCanvas.format.verticalAlignment = "center";
@@ -66,7 +71,10 @@ function formatCashflow(sheet) {
   for (const [address, title] of [["A10:L10", "Income"], ["N10:Y10", "Expenses"], ["AA10:AN10", "Transfer"]]) {
     fixedMergedBand(sheet, address, title, { font: { name: CJK, size: 12, bold: true, color: WHITE } });
   }
-  for (const address of ["A11:J11", "N11:W11", "AA11:AM11"]) {
+  // The compact schema uses A:J, N:W, and AA:AM. Format the cleared legacy tail
+  // cells as part of each visual header band so they keep the same font color
+  // and edge borders as the populated header cells.
+  for (const address of ["A11:L11", "N11:Y11", "AA11:AN11"]) {
     band(sheet.getRange(address), CJK, 11);
     bottomBorder(sheet.getRange(address));
   }
@@ -93,20 +101,20 @@ function formatCashflow(sheet) {
   grid(sheet.getRange("G3:H5"));
   grid(sheet.getRange("J3:K5"));
   grid(sheet.getRange("A7:B7"));
-  for (const address of ["A12:J454", "N12:W456", "AA12:AM500"]) {
+  for (const address of ["A12:J454", "N12:W1000", "AA12:AM500"]) {
     const range = sheet.getRange(address);
     range.format.font = { name: BODY, size: 10, color: LINK_GREEN };
     range.format.horizontalAlignment = "center";
     grid(range);
   }
-  for (const address of ["C12:E454", "H12:H454", "P12:R456", "U12:U456", "AC12:AF500", "AI12:AJ500", "AM12:AM500"]) {
+  for (const address of ["C12:E454", "H12:H454", "P12:R1000", "U12:U1000", "AC12:AF500", "AI12:AJ500", "AM12:AM500"]) {
     sheet.getRange(address).format.font = { name: CJK, size: 10, color: LINK_GREEN };
   }
-  for (const address of ["J12:J454", "W12:W456", "AK12:AL500"]) {
+  for (const address of ["J12:J454", "W12:W1000", "AK12:AL500"]) {
     sheet.getRange(address).format.font = { name: BODY, size: 11, color: BLACK };
   }
-  for (const address of ["A12:A454", "N12:N456", "AA12:AA500"]) sheet.getRange(address).format.numberFormat = "yyyy-mm-dd";
-  for (const address of ["F12:F454", "J12:J454", "S12:S456", "W12:W456", "AG12:AG500", "AK12:AL500"]) sheet.getRange(address).format.numberFormat = MONEY;
+  for (const address of ["A12:A454", "N12:N1000", "AA12:AA500"]) sheet.getRange(address).format.numberFormat = "yyyy-mm-dd";
+  for (const address of ["F12:F454", "J12:J454", "S12:S1000", "W12:W1000", "AG12:AG500", "AK12:AL500"]) sheet.getRange(address).format.numberFormat = MONEY;
   setColumnWidths(sheet, {
     A: 27.83, B: 13.83, C: 12.66, D: 11.83, E: 20, F: 11.5, G: 12.66, H: 13, I: 8, J: 18.16,
     N: 23.16, O: 11.83, P: 9.33, Q: 14.83, R: 23.66, S: 13, T: 13, U: 13, V: 8.16, W: 18.16,
@@ -216,6 +224,9 @@ function formatAsset(sheet) {
   sheet.getRange("E13:F201").format.font = { name: BODY, size: 10, color: BLACK };
   sheet.getRange("G13:G201").format.font = { name: BODY, size: 10, color: BLACK };
   applyAssetDetailFonts(sheet);
+  // Update time is a dated source marker in both manual-balance and linked
+  // security rows. Keep the whole column blue as the user-facing convention.
+  sheet.getRange("H13:H201").format.font = { name: CJK, size: 10, color: INPUT_BLUE };
   sheet.getRange("A12:H201").format.horizontalAlignment = "center";
   grid(sheet.getRange("A12:H201"));
   grid(sheet.getRange("J3:L7"));
